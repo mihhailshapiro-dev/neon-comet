@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no"/>
+<title>Neon Comet Jump</title>
+<style>
+  :root{
+    --bg-1:#0a0b1a;
+    --bg-2:#0e1030;
+    --neon-l:#7c3aed; /* фиолетовый */
+    --neon-r:#22d3ee; /* бирюзовый */
+    --text:#e5e7eb;
+    --muted:#94a3b8;
+  }
+  html,body{height:100%;margin:0;background:black;color:var(--text);font-family:system-ui,Segoe UI,Roboto,Inter,Arial}
+  .wrap{height:100%;display:grid;place-items:center}
+  .frame{
+    width:min(900px, 100vw);
+    height:min(1400px, 100vh);
+    position:relative;
+    border-radius:18px;
+    overflow:hidden;
+    box-shadow:0 25px 80px rgba(0,0,0,.65), inset 0 1px 0 rgba(255,255,255,.05);
+    outline:1px solid rgba(148,163,184,.25);
+  }
+  /* статичная неоновая подсветка по бокам */
+  .glow-l,.glow-r{
+    position:absolute;top:0;bottom:0;width:10vw;max-width:70px;pointer-events:none;
+    filter: blur(18px);
+    opacity:.65;
+  }
+  .glow-l{left:-2vw;background:linear-gradient(180deg, rgba(124,58,237,.55), rgba(124,58,237,.1))}
+  .glow-r{right:-2vw;background:linear-gradient(180deg, rgba(34,211,238,.55), rgba(34,211,238,.1))}
+  canvas{display:block;width:100%;height:100%;background:radial-gradient(1200px 900px at 10% 0%, #1a1040 0%, #0b0f23 55%, #070914 100%)}
+  .hud{
+    position:absolute;inset:0;pointer-events:none;
+  }
+  .chip{
+    position:absolute;top:10px;left:10px;
+    background:rgba(0,0,0,.35);backdrop-filter:blur(6px);
+    border:1px solid rgba(255,255,255,.15);border-radius:999px;
+    padding:6px 10px;font-size:12px;pointer-events:auto;user-select:none;cursor:pointer;
+  }
+  .chip.right{left:auto;right:10px;cursor:default;pointer-events:none}
+  .legend{
+    position:absolute;right:10px;top:38px;font-size:11px;color:var(--muted)
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="frame">
+    <div class="glow-l"></div>
+    <div class="glow-r"></div>
+    <canvas id="game"></canvas>
+    <div class="hud">
+      <button class="chip" id="muteBtn" aria-label="Mute/Unmute">🔊 Музыка</button>
+      <div class="chip right">Стрелки ◀ ▶ · Наклон на телефоне</div>
+      <div class="legend">Зелёные — платформы · 💚 пружины · ⚠️ шатающиеся/ломкие · 🌀 порталы</div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* =======================
+   БАЗА: Canvas + размеры
+   ======================= */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+let W=0,H=0,DPR=Math.max(1, Math.min(2, window.devicePixelRatio||1));
+function resize(){
+  const r = canvas.getBoundingClientRect();
+  W = Math.round(r.width);
+  H = Math.round(r.height);
+  canvas.width = Math.floor(W * DPR);
+  canvas.height = Math.floor(H * DPR);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener('resize', resize, {passive:true});
+
+/* =======================
+   Ввод
+   ======================= */
+const keys = {};
+window.addEventListener('keydown', e=>{ if(e.key==='ArrowLeft')keys.left=true; if(e.key==='ArrowRight')keys.right=true; });
+window.addEventListener('keyup', e=>{ if(e.key==='ArrowLeft')keys.left=false; if(e.key==='ArrowRight')keys.right=false; });
+
+const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+let accelX = 0;
+if (isMobile && 'DeviceOrientationEvent' in window) {
+  const ask = async ()=>{
+    try {
+      if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+        const st = await DeviceOrientationEvent.requestPermission();
+        if (st !== 'granted') return;
+      }
+      window.addEventListener('deviceorientation', (e)=>{ accelX = (e.gamma||0) / 1.5; }, {passive:true});
+    } catch {}
+  };
+  // активируем по первому тапу
+  window.addEventListener('pointerdown', ask, {once:true});
+}
+
+/* =======================
+   Физика и сущности
+   ======================= */
+const GRAVITY = 1600;
+const MOVE_ACCEL = 2300;
+const MOVE_MAX = 360;
+const FRICTION = 1600;
+const JUMP = 820;
+const SUPER_JUMP = 1280;
+
+const player = {
+  x: 0, y: 0, w: 36, h: 36,
+  vx: 0, vy: 0,
+  tail: [], tailMax: 22,
+};
+
+let cameraY = 0;
+let score = 0;
+
+const platforms = []; // {x,y,w,h,type:'static'|'move'|'break', vx, life}
+const springs = [];   // {x,y,w,h}
+const holes = [];     // {x,y,r}
+function rnd(a,b){ return Math.random()*(b-a)+a; }
+function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
+
+/* Безопасная стартовая генерация */
+function initLevel(){
+  platforms.length = 0; springs.length = 0; holes.length = 0;
+  // стартовая платформа по центру
+  const start = { x: W/2-55, y: H-70, w: 110, h: 16, type:'static', vx:0 };
+  platforms.push(start);
+
+  // позиция игрока над стартовой + стартовый прыжок (фикc падения)
+  player.w = 36; player.h = 36;
+  player.x = start.x + start.w/2 - player.w/2;
+  player.y = start.y - player.h - 2;
+  player.vx = 0;
+  player.vy = -12 * (H/560); // гарантированный подброс
+  player.tail = [];
+
+  // ещё ~28 платформ вверх
+  let y = start.y;
+  for (let i=1;i<=28;i++){
+    const gap = rnd(70, 120);
+    y -= gap;
+    const w = rnd(72, 110);
+    const x = rnd(12, W - w - 12);
+    let type = 'static';
+    const r = Math.random();
+    if (i>4 && r<0.16) type='move';
+    else if (i>6 && r<0.28) type='break';
+
+    const p = { x, y, w, h: 14, type, vx: (type==='move' ? (Math.random()<.5?-90:90) : 0), life: (type==='break'?1:Infinity) };
+    platforms.push(p);
+
+    if (type!=='break' && Math.random()<0.14){
+      springs.push({ x: x + w*0.5 - 9, y: y - 8, w: 18, h: 8 });
+    }
+    if (i>5 && Math.random()<0.08){
+      holes.push({ x: x + w*0.5, y: y - 18, r: rnd(12, 18) }); // немного увеличили чёрные дыры
+    }
+  }
+}
+
+/* Добавляем уровни наверх по мере подъёма */
+function addPlatformsAbove(){
+  while(platforms.length < 32){
+    const topY = Math.min(...platforms.map(p=>p.y));
+    const gap = rnd(70, 120);
+    const y = topY - gap;
+    const w = rnd(72, 110);
+    const x = rnd(12, W - w - 12);
+    let type = Math.random()<0.18 ? 'move' : (Math.random()<0.26 ? 'break' : 'static');
+    const p = {x,y,w,h:14,type,vx:(type==='move' ? (Math.random()<.5?-100:100) : 0), life:(type==='break'?1:Infinity)};
+    platforms.push(p);
+    if (type!=='break' && Math.random()<0.14) springs.push({x:x+w*0.5-9,y:y-8,w:18,h:8});
+    if (Math.random()<0.08) holes.push({x:x+w*0.5,y:y-18,r:rnd(12,18)});
+  }
+}
+
+/* =======================
+   Музыка (WebAudio)
+   ======================= */
+let audio = { ctx:null, master:null, started:false, muted:false };
+function audioInit(){
+  if (audio.started) return;
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) return;
+  audio.ctx = new AudioCtx();
+  audio.master = audio.ctx.createGain();
+  audio.master.gain.value = 0.15; // негромко
+  audio.master.connect(audio.ctx.destination);
+
+  // Простой циклический паттерн (неоновый арпеджио)
+  const tempo = 112;
+  const beat = 60/tempo;
+  const scale = [0,3,5,7,10,12]; // минорный вайб
+  const base = 220; // A3
+
+  function note(time, semis, len){
+    const osc = audio.ctx.createOscillator();
+    const g = audio.ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.value = base * Math.pow(2, semis/12);
+    g.gain.setValueAtTime(0, time);
+    g.gain.linearRampToValueAtTime(0.18, time+0.01);
+    g.gain.exponentialRampToValueAtTime(0.001, time+len);
+    osc.connect(g).connect(audio.master);
+    osc.start(time);
+    osc.stop(time+len+0.02);
+  }
+
+  const startT = audio.ctx.currentTime + 0.05;
+  function scheduleLoop(loopStart){
+    // 2 такта по 4 удара
+    for (let i=0;i<8;i++){
+      const t = loopStart + i*beat/2;
+      const deg = scale[i%scale.length];
+      const len = (beat/2)*0.9;
+      note(t, deg, len);
+      if (i%4===3) note(t, deg+12, len*0.6); // акцент
+    }
+    // планируем следующий цикл
+    const next = loopStart + 8*(beat/2);
+    setTimeout(()=>scheduleLoop(next), (next - audio.ctx.currentTime - 0.1)*1000);
+  }
+  scheduleLoop(startT);
+  audio.started = true;
+}
+const muteBtn = document.getElementById('muteBtn');
+muteBtn.addEventListener('click', async ()=>{
+  if (!audio.ctx){ audioInit(); }
+  if (audio.ctx && audio.ctx.state==='suspended') await audio.ctx.resume();
+  audio.muted = !audio.muted;
+  if (audio.master) audio.master.gain.value = audio.muted ? 0.0 : 0.15;
+  muteBtn.textContent = audio.muted ? '🔇 Музыка' : '🔊 Музыка';
+});
+// автозапуск при первом действии
+window.addEventListener('pointerdown', async ()=>{
+  if (!audio.ctx){ audioInit(); }
+  if (audio.ctx && audio.ctx.state==='suspended') await audio.ctx.resume();
+},{once:true});
+
+/* =======================
+   Рендер: фон + звёзды
+   ======================= */
+const starsFar=[], starsMid=[], starsNear=[];
+function initStars(){
+  starsFar.length=0; starsMid.length=0; starsNear.length=0;
+  for(let i=0;i<120;i++) starsFar.push({x:Math.random()*W, y:Math.random()*H, r:Math.random()*1.4+0.6});
+  for(let i=0;i<80;i++)  starsMid.push({x:Math.random()*W, y:Math.random()*H, r:Math.random()*1.8+0.9});
+  for(let i=0;i<50;i++)  starsNear.push({x:Math.random()*W, y:Math.random()*H, r:Math.random()*2.2+1.1});
+}
+function drawBackground(){
+  // плавный тёмный фон
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0, '#120a2a'); g.addColorStop(.5, '#0b0f23'); g.addColorStop(1, '#120a2a');
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+
+  // звёзды с лёгким параллаксом
+  function drawStars(arr, alpha){ ctx.save(); ctx.globalAlpha = alpha; ctx.fillStyle='#ffffff';
+    for(const s of arr){ ctx.beginPath(); ctx.arc(s.x, s.y - (cameraY*0.04), s.r, 0, Math.PI*2); ctx.fill(); }
+    ctx.restore();
+  }
+  drawStars(starsFar, .35);
+  drawStars(starsMid, .55);
+  drawStars(starsNear, .85);
+
+  // неоновые полупрозрачные рампы у краёв (дополнительная «подсветка»)
+  const gl = ctx.createLinearGradient(0,0,70,0);
+  gl.addColorStop(0,'rgba(124,58,237,.55)'); gl.addColorStop(1,'rgba(124,58,237,0)');
+  ctx.fillStyle = gl; ctx.fillRect(0,0,70,H);
+  const gr = ctx.createLinearGradient(W-70,0,W,0);
+  gr.addColorStop(0,'rgba(34,211,238,0)'); gr.addColorStop(1,'rgba(34,211,238,.55)');
+  ctx.fillStyle = gr; ctx.fillRect(W-70,0,70,H);
+}
+
+/* =======================
+   Рендер сущностей
+   ======================= */
+function roundRect(x,y,w,h,r){ const rr=Math.min(r,w/2,h/2); ctx.beginPath();
+  ctx.moveTo(x+rr,y); ctx.arcTo(x+w,y,x+w,y+h,rr); ctx.arcTo(x+w,y+h,x,y+h,rr);
+  ctx.arcTo(x,y+h,x,y,rr); ctx.arcTo(x,y,x+w,y,rr); ctx.closePath(); }
+
+function drawPlatform(p){
+  const y = p.y - cameraY; if (y<-30 || y>H+30) return;
+  const grad = ctx.createLinearGradient(p.x,y,p.x,y+p.h);
+  grad.addColorStop(0,'rgba(34,197,94,.95)'); grad.addColorStop(1,'rgba(16,185,129,.9)');
+  ctx.fillStyle = grad; roundRect(p.x,y,p.w,p.h,6); ctx.fill();
+  if (p.type==='move'){ ctx.globalAlpha=.6; ctx.fillStyle='#e2e8f0'; ctx.fillRect(p.x+p.w/2-4,y+2,8,p.h-4); ctx.globalAlpha=1; }
+  if (p.type==='break'){ ctx.globalAlpha=.45; ctx.strokeStyle='#fca5a5'; ctx.setLineDash([5,4]); ctx.lineWidth=1.2; ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha=1; }
+}
+function drawSpring(s){
+  const y = s.y - cameraY; if (y<-20 || y>H+20) return;
+  ctx.fillStyle='#bbf7d0'; roundRect(s.x,y,s.w,s.h,3); ctx.fill();
+  ctx.strokeStyle='#166534'; ctx.stroke();
+}
+function drawHole(h){
+  const y = h.y - cameraY; if (y<-40 || y>H+40) return;
+  const g = ctx.createRadialGradient(h.x,y,0,h.x,y,h.r);
+  g.addColorStop(0,'rgba(147,51,234,.9)'); g.addColorStop(1,'rgba(2,6,23,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(h.x,y,h.r,0,Math.PI*2); ctx.fill();
+}
+
+/* Комета + хвост */
+function drawTail(){
+  for(let i=0;i<player.tail.length;i++){
+    const t = player.tail[i];
+    const alpha = 1 - i/player.tail.length;
+    const grad = ctx.createLinearGradient(t.x-8,t.y-8,t.x+8,t.y+8);
+    grad.addColorStop(0, `rgba(255, 20, 147, ${alpha*0.9})`);
+    grad.addColorStop(.5, `rgba(138, 43, 226, ${alpha*0.7})`);
+    grad.addColorStop(1, `rgba(34, 211, 238, ${alpha*0.6})`);
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.arc(t.x, t.y - cameraY, 10 * (alpha*0.9+0.3), 0, Math.PI*2); ctx.fill();
+  }
+}
+function drawPlayer(){
+  const y = player.y - cameraY;
+  // тень
+  ctx.save(); ctx.globalAlpha=.25;
+  ctx.beginPath(); ctx.ellipse(player.x+player.w/2, y+player.h, player.w*.55, 8, 0,0,Math.PI*2); ctx.fillStyle='#000'; ctx.fill();
+  ctx.restore();
+
+  // "тело кометы" — капсула
+  const grad = ctx.createLinearGradient(player.x, y, player.x, y+player.h);
+  grad.addColorStop(0,'#ffd1f3'); grad.addColorStop(1,'#ff6adf');
+  ctx.fillStyle = grad;
+  roundRect(player.x, y, player.w, player.h, 16);
+  ctx.fill();
+
+  // "нос" кометы
+  ctx.beginPath();
+  ctx.moveTo(player.x+player.w/2, y-6);
+  ctx.lineTo(player.x+player.w*0.8, y+player.h*0.25);
+  ctx.lineTo(player.x+player.w*0.2, y+player.h*0.25);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(255,255,255,.85)';
+  ctx.fill();
+}
+
+/* =======================
+   Логика игры
+   ======================= */
+function reset(){
+  cameraY = Math.min(0, H-120);
+  score = 0;
+  initLevel();
+  addPlatformsAbove();
+}
+function physics(dt){
+  // управление
+  let ax = 0;
+  if (isMobile) ax += accelX*MOVE_ACCEL;
+  if (keys.left) ax -= MOVE_ACCEL;
+  if (keys.right) ax += MOVE_ACCEL;
+
+  if (!keys.left && !keys.right && Math.abs(accelX)<0.1){
+    // трение
+    if (player.vx>0) player.vx = Math.max(0, player.vx - FRICTION*dt);
+    else if (player.vx<0) player.vx = Math.min(0, player.vx + FRICTION*dt);
+  } else {
+    player.vx = clamp(player.vx + ax*dt, -MOVE_MAX, MOVE_MAX);
+  }
+
+  // движение платформ
+  for (const p of platforms){
+    if (p.type==='move'){
+      p.x += p.vx*dt;
+      if (p.x<8){ p.x=8; p.vx*=-1; }
+      if (p.x+p.w>W-8){ p.x=W-8-p.w; p.vx*=-1; }
+    }
+  }
+
+  // физика игрока
+  player.vy += GRAVITY*dt;
+  player.x += player.vx*dt;
+  player.y += player.vy*dt;
+
+  // wrap по горизонтали
+  if (player.x < -player.w) player.x = W;
+  if (player.x > W) player.x = -player.w;
+
+  // столкновения (только когда падаем)
+  if (player.vy>0){
+    for (let i=0;i<platforms.length;i++){
+      const p = platforms[i];
+      const px1=p.x, px2=p.x+p.w, py1=p.y, py2=p.y+p.h;
+      const nx1=player.x, nx2=player.x+player.w;
+      const ny2=player.y+player.h, ny2Prev=ny2 - player.vy*dt;
+      const over = nx2>px1 && nx1<px2;
+      const crossTop = ny2Prev <= py1 && ny2 >= py1;
+      if (over && crossTop){
+        player.y = py1 - player.h;
+        // обычный прыжок
+        player.vy = -JUMP;
+
+        // пружина?
+        const spring = springs.find(s=> Math.abs((s.x+s.w/2) - (nx1+player.w/2)) < (p.w/2) && Math.abs((s.y) - (py1-8))<1 );
+        if (spring) player.vy = -SUPER_JUMP;
+
+        // ломкая?
+        if (p.type==='break'){
+          p.life -= 1;
+          if (p.life<=0){ platforms.splice(i,1); i--; }
+        }
+      }
+    }
+  }
+
+  // порталы (чёрные дыры)
+  for (const h of holes){
+    const dx = (player.x+player.w/2) - h.x;
+    const dy = (player.y+player.h/2) - h.y;
+    const d = Math.hypot(dx,dy);
+    if (d < h.r + 12){
+      // телепорт на случайную платформу выше
+      const upper = platforms.filter(p=> p.y < player.y - 160);
+      if (upper.length){
+        const p = upper[Math.floor(Math.random()*upper.length)];
+        player.x = p.x + p.w/2 - player.w/2;
+        player.y = p.y - player.h - 2;
+        player.vy = -JUMP*0.9;
+      }
+    }
+  }
+
+  // камера
+  cameraY = Math.min(cameraY, player.y - H*0.42);
+
+  // чистим низ / добавляем верх
+  const lowestAllowed = cameraY + H + 90;
+  for (let i=platforms.length-1;i>=0;i--) if (platforms[i].y > lowestAllowed) platforms.splice(i,1);
+  for (let i=springs.length-1;i>=0;i--) if (springs[i].y > lowestAllowed) springs.splice(i,1);
+  for (let i=holes.length-1;i>=0;i--) if (holes[i].y > lowestAllowed) holes.splice(i,1);
+  addPlatformsAbove();
+
+  // очки = максимальная высота
+  const h = Math.max(0, -(player.y - (H - 90)));
+  score = Math.max(score, h);
+
+  // падение ниже экрана — рестарт со стартовой платформы
+  if (player.y - cameraY > H + 80){
+    // мягкий рестарт: перенос к самой нижней платформе
+    const bottom = platforms.reduce((a,p)=> p.y>a.y? p : a, platforms[0]);
+    player.x = bottom.x + bottom.w/2 - player.w/2;
+    player.y = bottom.y - player.h - 2;
+    player.vy = -JUMP*0.8;
+    cameraY = Math.min(0, bottom.y - H + 120);
+  }
+}
+
+/* =======================
+   Игровой цикл
+   ======================= */
+let last=0;
+function loop(t){
+  const dt = Math.min(0.033, (t-last)/1000 || 0.016); last=t;
+
+  physics(dt);
+
+  // фон
+  drawBackground();
+
+  // хвост
+  player.tail.unshift({x: player.x+player.w/2, y: player.y+player.h/2});
+  if (player.tail.length > player.tailMax) player.tail.pop();
+  drawTail();
+
+  // объекты
+  for (const p of platforms) drawPlatform(p);
+  for (const s of springs) drawSpring(s);
+  for (const h of holes) drawHole(h);
+
+  // игрок
+  drawPlayer();
+
+  // HUD простейший
+  ctx.fillStyle='rgba(255,255,255,.9)';
+  ctx.font='600 14px system-ui,Segoe UI,Roboto';
+  ctx.fillText('Высота: '+Math.floor(score), 10, 20);
+
+  requestAnimationFrame(loop);
+}
+
+/* =======================
+   Старт
+   ======================= */
+resize(); initStars(); reset();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
+
+
+
